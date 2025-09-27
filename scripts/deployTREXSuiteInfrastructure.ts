@@ -1,4 +1,4 @@
-import { BigNumber, Contract, Signer, Wallet } from 'ethers';
+import { BigNumber, Contract, Signer, Wallet, providers } from 'ethers';
 import { ethers } from 'hardhat';
 import OnchainID from '@onchain-id/solidity';
 
@@ -37,12 +37,12 @@ async function deployIdentityProxy(
   managementKey: string,
   signer: Signer,
 ) {
-  const factory = new ethers.ContractFactory(
-    OnchainID.contracts.IdentityProxy.abi,
-    OnchainID.contracts.IdentityProxy.bytecode,
-    signer,
+  const identity = await ethers.deployContract(
+    'IdentityProxy',
+    [implementationAuthority, managementKey],
+    signer
   );
-  const identity = await factory.deploy(implementationAuthority, managementKey);
+
   await identity.deployed();
   return ethers.getContractAt('Identity', identity.address, signer);
 }
@@ -103,11 +103,61 @@ async function deployTREXImplementationAuthority(signer: Signer, contracts: Reco
   return trexImplementationAuthority;
 }
 
-async function deployTREXSuiteInfrastructure(): Promise<InfrastructureDeploymentResult> {
-  const [deployer, tokenIssuer, tokenAgent, tokenAdmin, claimIssuer] =
-    await ethers.getSigners();
+type RoleKey = 'tokenIssuer' | 'tokenAgent' | 'tokenAdmin' | 'claimIssuer';
 
-  const claimIssuerSigningKey = Wallet.createRandom();
+async function resolveRoleSigner(
+  role: RoleKey,
+  availableSigner: Signer | undefined,
+  provider: providers.Provider,
+  deployer: Signer,
+): Promise<Signer> {
+  const envKeyName = `TREX_${role.toUpperCase()}_PRIVATE_KEY` as const;
+  const envKeyValue = process.env[envKeyName];
+
+  if (envKeyValue) {
+    return new Wallet(envKeyValue, provider);
+  }
+
+  if (availableSigner) {
+    return availableSigner;
+  }
+
+  const deployerAddress = await deployer.getAddress();
+
+  console.warn(
+    `⚠️  No dedicated signer configured for ${role}. Falling back to deployer account (${deployerAddress}).`,
+  );
+  return deployer;
+}
+
+async function deployTREXSuiteInfrastructure(): Promise<InfrastructureDeploymentResult> {
+  const availableSigners = await ethers.getSigners();
+
+  if (availableSigners.length === 0) {
+    throw new Error('No signer available in the current Hardhat network configuration.');
+  }
+
+  const deployer = availableSigners[0];
+  const provider = deployer.provider ?? ethers.provider;
+
+  if (!provider) {
+    throw new Error('Unable to resolve a provider from the deployer signer.');
+  }
+
+  const tokenIssuer = await resolveRoleSigner('tokenIssuer', availableSigners[1], provider, deployer);
+  const tokenAgent = await resolveRoleSigner('tokenAgent', availableSigners[2], provider, deployer);
+  const tokenAdmin = await resolveRoleSigner('tokenAdmin', availableSigners[3], provider, deployer);
+  const claimIssuer = await resolveRoleSigner('claimIssuer', availableSigners[4], provider, deployer);
+
+  const deployerAddress = await deployer.getAddress();
+  const tokenIssuerAddress = await tokenIssuer.getAddress();
+  const tokenAgentAddress = await tokenAgent.getAddress();
+  const tokenAdminAddress = await tokenAdmin.getAddress();
+  const claimIssuerAddress = await claimIssuer.getAddress();
+
+  const claimIssuerSigningKey = process.env.TREX_CLAIM_ISSUER_SIGNING_KEY_PRIVATE_KEY
+    ? new Wallet(process.env.TREX_CLAIM_ISSUER_SIGNING_KEY_PRIVATE_KEY)
+    : Wallet.createRandom();
 
   const claimTopicsRegistryImplementation = await ethers.deployContract('ClaimTopicsRegistry', deployer);
   const trustedIssuersRegistryImplementation = await ethers.deployContract('TrustedIssuersRegistry', deployer);
@@ -134,21 +184,39 @@ async function deployTREXSuiteInfrastructure(): Promise<InfrastructureDeployment
   );
   await identityFactory.connect(deployer).addTokenFactory(trexFactory.address);
 
-  const claimTopicsRegistry = await ethers
-    .deployContract('ClaimTopicsRegistryProxy', [trexImplementationAuthority.address], deployer)
-    .then(async (proxy) => ethers.getContractAt('ClaimTopicsRegistry', proxy.address));
+  const claimTopicsRegistryProxy = await ethers.deployContract(
+    'ClaimTopicsRegistryProxy',
+    [trexImplementationAuthority.address],
+    deployer
+  );
+  await claimTopicsRegistryProxy.deployed();
+  const claimTopicsRegistry = await ethers.getContractAt('ClaimTopicsRegistry', claimTopicsRegistryProxy.address);
+  console.log(`✅ ClaimTopicsRegistry deployed to: ${claimTopicsRegistry.address}`);
 
-  const trustedIssuersRegistry = await ethers
-    .deployContract('TrustedIssuersRegistryProxy', [trexImplementationAuthority.address], deployer)
-    .then(async (proxy) => ethers.getContractAt('TrustedIssuersRegistry', proxy.address));
+  const trustedIssuersRegistryProxy = await ethers.deployContract(
+    'TrustedIssuersRegistryProxy',
+    [trexImplementationAuthority.address],
+    deployer
+  );
+  await trustedIssuersRegistryProxy.deployed();
+  const trustedIssuersRegistry = await ethers.getContractAt('TrustedIssuersRegistry', trustedIssuersRegistryProxy.address);
 
-  const identityRegistryStorage = await ethers
-    .deployContract('IdentityRegistryStorageProxy', [trexImplementationAuthority.address], deployer)
-    .then(async (proxy) => ethers.getContractAt('IdentityRegistryStorage', proxy.address));
+  console.log(`✅ TrustedIssuersRegistry deployed to: ${trustedIssuersRegistry.address}`);
+
+  const identityRegistryStorageProxy = await ethers.deployContract(
+    'IdentityRegistryStorageProxy',
+    [trexImplementationAuthority.address],
+    deployer
+  );
+  await identityRegistryStorageProxy.deployed();
+  const identityRegistryStorage = await ethers.getContractAt('IdentityRegistryStorage', identityRegistryStorageProxy.address);
+  console.log(`✅ IdentityRegistryStorage deployed to: ${identityRegistryStorage.address}`);
 
   const defaultCompliance = await ethers.deployContract('DefaultCompliance', deployer);
+  await defaultCompliance.deployed();
+  console.log(`✅ DefaultCompliance deployed to: ${defaultCompliance.address}`);
 
-  const identityRegistry = await ethers
+  const identityRegistryProxy = await ethers
     .deployContract(
       'IdentityRegistryProxy',
       [
@@ -158,47 +226,52 @@ async function deployTREXSuiteInfrastructure(): Promise<InfrastructureDeployment
         identityRegistryStorage.address,
       ],
       deployer,
-    )
-    .then(async (proxy) => ethers.getContractAt('IdentityRegistry', proxy.address));
+    );
+  await identityRegistryProxy.deployed();
+  const identityRegistry = await ethers.getContractAt('IdentityRegistry', identityRegistryProxy.address);
+  console.log(`✅ IdentityRegistry deployed to: ${identityRegistry.address}`);
 
   const tokenOID = await deployIdentityProxy(
     identityImplementationAuthority.address,
-    tokenIssuer.address,
+    tokenIssuerAddress,
     deployer,
   );
+  console.log(`✅ Token OnchainID deployed to: ${tokenOID.address}`);
 
   const tokenName = process.env.TREX_TOKEN_NAME ?? 'TREXDINO';
   const tokenSymbol = process.env.TREX_TOKEN_SYMBOL ?? 'TREX';
   const tokenDecimals = BigNumber.from(process.env.TREX_TOKEN_DECIMALS ?? '0');
 
-  const token = await ethers
-    .deployContract(
-      'TokenProxy',
-      [
-        trexImplementationAuthority.address,
-        identityRegistry.address,
-        defaultCompliance.address,
-        tokenName,
-        tokenSymbol,
-        tokenDecimals,
-        tokenOID.address,
-      ],
-      deployer,
-    )
-    .then(async (proxy) => ethers.getContractAt('Token', proxy.address));
+  const tokenProxy = await ethers.deployContract(
+    'TokenProxy',
+    [
+      trexImplementationAuthority.address,
+      identityRegistry.address,
+      defaultCompliance.address,
+      tokenName,
+      tokenSymbol,
+      tokenDecimals,
+      tokenOID.address,
+    ],
+    deployer
+  );
+  await tokenProxy.deployed();
+  const token = await ethers.getContractAt('Token', tokenProxy.address);
+  console.log(`✅ Token deployed to: ${token.address}`);
 
   const agentManager = await ethers.deployContract('AgentManager', [token.address], tokenAgent);
+  console.log(`✅ AgentManager deployed to: ${agentManager.address}`);
 
   await identityRegistryStorage.connect(deployer).bindIdentityRegistry(identityRegistry.address);
-  await token.connect(deployer).addAgent(tokenAgent.address);
-  await identityRegistry.connect(deployer).addAgent(tokenAgent.address);
+  await token.connect(deployer).addAgent(tokenAgentAddress);
+  await identityRegistry.connect(deployer).addAgent(tokenAgentAddress);
   await identityRegistry.connect(deployer).addAgent(token.address);
 
 
   const claimTopics = [ethers.utils.id('CLAIM_TOPIC')];
   await claimTopicsRegistry.connect(deployer).addClaimTopic(claimTopics[0]);
 
-  const claimIssuerContract = await ethers.deployContract('ClaimIssuer', [claimIssuer.address], claimIssuer);
+  const claimIssuerContract = await ethers.deployContract('ClaimIssuer', [claimIssuerAddress], claimIssuer);
   await claimIssuerContract
     .connect(claimIssuer)
     .addKey(
@@ -211,7 +284,7 @@ async function deployTREXSuiteInfrastructure(): Promise<InfrastructureDeployment
 
   await trustedIssuersRegistry.connect(deployer).addTrustedIssuer(claimIssuerContract.address, claimTopics);
 
-  await agentManager.connect(tokenAgent).addAgentAdmin(tokenAdmin.address);
+  await agentManager.connect(tokenAgent).addAgentAdmin(tokenAdminAddress);
   await token.connect(deployer).addAgent(agentManager.address);
   await identityRegistry.connect(deployer).addAgent(agentManager.address);
 
@@ -220,11 +293,11 @@ async function deployTREXSuiteInfrastructure(): Promise<InfrastructureDeployment
 
   return {
     accounts: {
-      deployer: deployer.address,
-      tokenIssuer: tokenIssuer.address,
-      tokenAgent: tokenAgent.address,
-      tokenAdmin: tokenAdmin.address,
-      claimIssuer: claimIssuer.address,
+      deployer: deployerAddress,
+      tokenIssuer: tokenIssuerAddress,
+      tokenAgent: tokenAgentAddress,
+      tokenAdmin: tokenAdminAddress,
+      claimIssuer: claimIssuerAddress,
       claimIssuerSigningKey: claimIssuerSigningKey.address,
     },
     suite: {
