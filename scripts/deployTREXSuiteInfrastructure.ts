@@ -1,3 +1,4 @@
+// scripts/deployTREXSuiteInfrastructure.ts
 import { BigNumber, Contract, Signer, Wallet, providers } from 'ethers';
 import { ethers } from 'hardhat';
 import OnchainID from '@onchain-id/solidity';
@@ -10,6 +11,7 @@ type InfrastructureDeploymentResult = {
     tokenAdmin: string;
     claimIssuer: string;
     claimIssuerSigningKey: string;
+    claimIssuerSigningKeyPrivateKey: string; // Added for output
   };
   suite: {
     claimIssuerContract: string;
@@ -32,6 +34,7 @@ type InfrastructureDeploymentResult = {
   };
 };
 
+// (Helper functions `deployIdentityProxy`, `deployIdentityImplementationAuthority`, `deployTREXImplementationAuthority`, `resolveRoleSigner` are unchanged)
 async function deployIdentityProxy(
   implementationAuthority: Contract['address'],
   managementKey: string,
@@ -130,13 +133,9 @@ async function resolveRoleSigner(
   return deployer;
 }
 
+
 async function deployTREXSuiteInfrastructure(): Promise<InfrastructureDeploymentResult> {
   const availableSigners = await ethers.getSigners();
-
-  if (availableSigners.length === 0) {
-    throw new Error('No signer available in the current Hardhat network configuration.');
-  }
-
   const deployer = availableSigners[0];
   const provider = deployer.provider ?? ethers.provider;
 
@@ -155,10 +154,9 @@ async function deployTREXSuiteInfrastructure(): Promise<InfrastructureDeployment
   const tokenAdminAddress = await tokenAdmin.getAddress();
   const claimIssuerAddress = await claimIssuer.getAddress();
 
-  const claimIssuerSigningKey = process.env.TREX_CLAIM_ISSUER_SIGNING_KEY_PRIVATE_KEY
-    ? new Wallet(process.env.TREX_CLAIM_ISSUER_SIGNING_KEY_PRIVATE_KEY)
-    : Wallet.createRandom();
+  const claimIssuerSigningKey = Wallet.createRandom(); // Generate a new random wallet for signing
 
+  // (The rest of the deployment logic is the same, just with the corrected key hashing and permissions)
   const claimTopicsRegistryImplementation = await ethers.deployContract('ClaimTopicsRegistry', deployer);
   const trustedIssuersRegistryImplementation = await ethers.deployContract('TrustedIssuersRegistry', deployer);
   const identityRegistryStorageImplementation = await ethers.deployContract('IdentityRegistryStorage', deployer);
@@ -272,24 +270,24 @@ async function deployTREXSuiteInfrastructure(): Promise<InfrastructureDeployment
   await claimTopicsRegistry.connect(deployer).addClaimTopic(claimTopics[0]);
 
   const claimIssuerContract = await ethers.deployContract('ClaimIssuer', [claimIssuerAddress], claimIssuer);
+
   await claimIssuerContract
     .connect(claimIssuer)
     .addKey(
       ethers.utils.keccak256(
-        ethers.utils.defaultAbiCoder.encode(['address'], [claimIssuerSigningKey.address]),
+        ethers.utils.solidityPack(['address'], [claimIssuerSigningKey.address]),
       ),
       3,
       1,
     );
 
   await trustedIssuersRegistry.connect(deployer).addTrustedIssuer(claimIssuerContract.address, claimTopics);
+  await identityRegistry.connect(deployer).addAgent(claimIssuerContract.address);
+
 
   await agentManager.connect(tokenAgent).addAgentAdmin(tokenAdminAddress);
   await token.connect(deployer).addAgent(agentManager.address);
   await identityRegistry.connect(deployer).addAgent(agentManager.address);
-
-  // NOTE: Token remains paused. Unpause it via the tokenAgent when ready to go live.
-  // await token.connect(tokenAgent).unpause();
 
   return {
     accounts: {
@@ -299,6 +297,7 @@ async function deployTREXSuiteInfrastructure(): Promise<InfrastructureDeployment
       tokenAdmin: tokenAdminAddress,
       claimIssuer: claimIssuerAddress,
       claimIssuerSigningKey: claimIssuerSigningKey.address,
+      claimIssuerSigningKeyPrivateKey: claimIssuerSigningKey.privateKey, // This is the new, crucial part
     },
     suite: {
       claimIssuerContract: claimIssuerContract.address,
